@@ -1,136 +1,142 @@
-<!-- file: public/index.html -->
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Công cụ tạo Link Theo dõi</title>
-    <link rel="stylesheet" href="/style.css">
-</head>
-<body>
+// file: index.js
+const express = require('express');
+const path = require('path');
+const { Pool } = require('pg');
+const cors = require('cors');
+const { nanoid } = require('nanoid');
+const fetch = require('node-fetch');
 
-    <div class="container">
-        <h2>Tạo liên kết theo dõi mới</h2>
-        <p>Nhấn nút bên dưới để tạo một liên kết có thể theo dõi vị trí và thiết bị người nhấp chuột.</p>
-        <button id="create-link-btn">Tạo liên kết ngay!</button>
-        <div class="loader" id="create-loader"></div>
-        <div id="result" class="result-box" style="display:none;"></div>
-    </div>
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-    <div class="container">
-        <h2>Kiểm tra kết quả theo dõi</h2>
-        <p>Nhập mã bí mật của bạn để xem những ai đã nhấp vào liên kết.</p>
-        <div class="form-group">
-            <label for="tracking-code-input">Mã bí mật:</label>
-            <input type="text" id="tracking-code-input" placeholder="Dán mã bí mật vào đây" />
-        </div>
-        <button id="view-results-btn">Xem kết quả</button>
-        <div class="loader" id="view-loader"></div>
-        <div id="results-display"></div>
-    </div>
+// ---- MIDDLEWARE ----
+app.use(cors()); // Cho phép yêu cầu từ các tên miền khác
+app.use(express.json()); // Đọc dữ liệu JSON từ request
+app.use(express.static(path.join(__dirname, 'public'))); // Phục vụ các tệp HTML, CSS, JS trong thư mục 'public'
 
-<script>
-    // Giao diện không cần URL vì nó được phục vụ từ cùng một nơi với API
-    const createBtn = document.getElementById('create-link-btn');
-    const resultDiv = document.getElementById('result');
-    const createLoader = document.getElementById('create-loader');
-    
-    const viewBtn = document.getElementById('view-results-btn');
-    const trackingCodeInput = document.getElementById('tracking-code-input');
-    const resultsDisplayDiv = document.getElementById('results-display');
-    const viewLoader = document.getElementById('view-loader');
-    
-    // --- Chức năng tạo link ---
-    createBtn.addEventListener('click', async () => {
-        createBtn.disabled = true;
-        createLoader.style.display = 'block';
-        resultDiv.style.display = 'none';
+// ---- DATABASE CONNECTION ----
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL, // Render cung cấp biến này
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
+// Hàm khởi tạo database
+const initializeDatabase = async () => {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS links (
+            id SERIAL PRIMARY KEY,
+            unique_path VARCHAR(10) UNIQUE NOT NULL,
+            tracking_code VARCHAR(15) UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS clicks (
+            id SERIAL PRIMARY KEY,
+            link_id INTEGER REFERENCES links(id) ON DELETE CASCADE,
+            ip_address VARCHAR(45),
+            user_agent TEXT,
+            country VARCHAR(100),
+            city VARCHAR(100),
+            latitude REAL,
+            longitude REAL,
+            timestamp TIMESTAMPTZ DEFAULT NOW()
+        );
+    `);
+    console.log("Database tables checked/created successfully.");
+};
+
+// ---- API ROUTES ----
+
+// [API] Tạo một liên kết theo dõi mới
+app.post('/api/links', async (req, res) => {
+    try {
+        const uniquePath = nanoid(7);
+        const trackingCode = nanoid(10).toUpperCase();
+
+        const result = await pool.query(
+            'INSERT INTO links(unique_path, tracking_code) VALUES($1, $2) RETURNING *',
+            [uniquePath, trackingCode]
+        );
+
+        // Tự động tạo URL chính xác dựa trên request
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+        const host = req.get('host');
+        const trackableLink = `${protocol}://${host}/track/${uniquePath}`;
+
+        res.status(201).json({ 
+            tracking_code: result.rows[0].tracking_code, 
+            trackable_link: trackableLink 
+        });
+    } catch (error) {
+        console.error('Error creating link:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// [LOGIC] Xử lý khi người dùng nhấp vào link theo dõi
+app.get('/track/:uniquePath', async (req, res) => {
+    try {
+        const { uniquePath } = req.params;
+        const linkResult = await pool.query('SELECT id FROM links WHERE unique_path = $1', [uniquePath]);
+
+        if (linkResult.rows.length === 0) {
+            return res.status(404).send('Link not found');
+        }
+
+        const linkId = linkResult.rows[0].id;
+        
+        const ip_address = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const user_agent = req.headers['user-agent'];
+        
+        let geoData = { country: 'N/A', city: 'N/A', lat: null, lon: null };
         try {
-            // API call dùng đường dẫn tương đối
-            const response = await fetch('/api/links', { method: 'POST' });
-            const data = await response.json();
-
-            if (response.ok) {
-                resultDiv.innerHTML = `
-                    <p><b>✅ Tạo thành công!</b></p>
-                    <p><b>🔗 Link để gửi đi:</b></p> 
-                    <input type="text" value="${data.trackable_link}" readonly onclick="this.select()">
-                    <p style="color:red; font-weight:bold;"><b>🔑 Mã bí mật (lưu lại cẩn thận):</b></p>
-                    <input type="text" value="${data.tracking_code}" readonly onclick="this.select()">
-                `;
-            } else {
-                resultDiv.innerHTML = `<p class="error">Lỗi: ${data.error || 'Không thể tạo link.'}</p>`;
-            }
-            resultDiv.style.display = 'block';
-        } catch (error) {
-            resultDiv.innerHTML = '<p class="error">Đã có lỗi mạng xảy ra. Vui lòng thử lại.</p>';
-            resultDiv.style.display = 'block';
-        } finally {
-            createBtn.disabled = false;
-            createLoader.style.display = 'none';
-        }
-    });
-    
-    // --- Chức năng xem kết quả ---
-    viewBtn.addEventListener('click', async () => {
-        const trackingCode = trackingCodeInput.value.trim();
-        if (!trackingCode) {
-            alert('Vui lòng nhập mã bí mật.');
-            return;
+            // Sử dụng ip-api.com, miễn phí với giới hạn
+            const geoResponse = await fetch(`http://ip-api.com/json/${ip_address.split(',')[0].trim()}`);
+            const data = await geoResponse.json();
+            if (data.status === 'success') geoData = data;
+        } catch (geoError) {
+            console.error("Geo API Error:", geoError);
         }
 
-        viewBtn.disabled = true;
-        viewLoader.style.display = 'block';
-        resultsDisplayDiv.innerHTML = '';
+        await pool.query(
+            `INSERT INTO clicks(link_id, ip_address, user_agent, country, city, latitude, longitude)
+             VALUES($1, $2, $3, $4, $5, $6, $7)`,
+            [linkId, ip_address, user_agent, geoData.country, geoData.city, geoData.lat, geoData.lon]
+        );
+        
+        // Chuyển hướng người dùng về trang chủ
+        res.redirect('/');
+    } catch (error) {
+        console.error('Error tracking click:', error);
+        res.status(500).send('Error processing your request.');
+    }
+});
 
-        try {
-            // API call dùng đường dẫn tương đối
-            const response = await fetch(`/api/results/${trackingCode}`);
-            const data = await response.json();
+// [API] Xem kết quả tracking
+app.get('/api/results/:trackingCode', async (req, res) => {
+    try {
+        const { trackingCode } = req.params;
+        const linkResult = await pool.query('SELECT id FROM links WHERE tracking_code = $1', [trackingCode]);
 
-            if (response.ok) {
-                if (data.length === 0) {
-                    resultsDisplayDiv.innerHTML = '<p>Chưa có ai nhấp vào liên kết này.</p>';
-                } else {
-                    let tableHTML = `
-                        <p><b>Tổng số lượt nhấp: ${data.length}</b></p>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Thời gian</th>
-                                    <th>Địa chỉ IP</th>
-                                    <th>Vị trí</th>
-                                    <th>Thiết bị (User Agent)</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                    `;
-                    data.forEach(click => {
-                        const mapLink = click.latitude ? `<a href="https://www.google.com/maps?q=${click.latitude},${click.longitude}" target="_blank">Xem bản đồ</a>` : 'N/A';
-                        tableHTML += `
-                            <tr>
-                                <td>${new Date(click.timestamp).toLocaleString('vi-VN')}</td>
-                                <td>${click.ip_address}</td>
-                                <td>${click.city || 'N/A'}, ${click.country || 'N/A'} (${mapLink})</td>
-                                <td class="user-agent" title="${click.user_agent}">${click.user_agent}</td>
-                            </tr>
-                        `;
-                    });
-                    tableHTML += `</tbody></table>`;
-                    resultsDisplayDiv.innerHTML = tableHTML;
-                }
-            } else {
-                 resultsDisplayDiv.innerHTML = `<p class="error">Lỗi: ${data.error || 'Mã không hợp lệ hoặc có lỗi.'}</p>`;
-            }
-        } catch (error) {
-            resultsDisplayDiv.innerHTML = '<p class="error">Đã có lỗi mạng khi kết nối. Vui lòng thử lại.</p>';
-        } finally {
-            viewBtn.disabled = false;
-            viewLoader.style.display = 'none';
+        if (linkResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Mã theo dõi không hợp lệ' });
         }
-    });
-</script>
+        
+        const linkId = linkResult.rows[0].id;
+        const clicksResult = await pool.query('SELECT * FROM clicks WHERE link_id = $1 ORDER BY timestamp DESC', [linkId]);
+        
+        res.json(clicksResult.rows);
+    } catch (error) {
+        console.error('Error fetching results:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
 
-</body>
-</html>
+// ---- START SERVER ----
+app.listen(PORT, () => {
+    initializeDatabase().catch(err => console.error("Database initialization failed:", err));
+    console.log(`Server is running on port ${PORT}`);
+});
